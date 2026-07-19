@@ -17,6 +17,10 @@ Use iAgent to generate a 16:9, 2K product poster.
 
 On the first tool call, Codex returns a loopback connection URL. Open it in the browser where you use iAgent. The local bridge connects automatically after you sign in and enter Creative Studio.
 
+## Reliable generation
+
+Each new image or video job uses a unique `clientRequestId`, which also acts as its recoverable task ID. Replaying the same ID returns the original task instead of creating another billable generation. If a tool result is unknown, the plugin preserves the original prompt and does not automatically retry with a new ID.
+
 ## Privacy
 
 - The plugin and browser bridge run locally.

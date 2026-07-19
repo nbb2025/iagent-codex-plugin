@@ -1,6 +1,6 @@
 {
   "name": "iagent",
-  "version": "0.1.0+codex.20260719181049",
+  "version": "0.1.0+codex.20260719195112",
   "description": "Generate images and videos in iAgent from Codex through a local browser bridge.",
   "author": {
     "name": "iAgent",

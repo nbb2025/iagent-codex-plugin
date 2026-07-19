@@ -12,7 +12,10 @@ const DEFAULT_PORT = 17372
 const CONFIG_FILE = process.env.IAGENT_AGENT_CONFIG || path.join(os.homedir(), '.iagent', 'codex-agent.json')
 const STUDIO_ORIGIN = process.env.IAGENT_STUDIO_ORIGIN || 'https://ai.iagent.dev'
 const TOOL_TIMEOUT_MS = 60_000
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60_000
 const BRIDGE_SERVICE = 'iagent-codex-bridge'
+const GENERATION_TOOLS = new Set(['iagent_generate_image', 'iagent_generate_video'])
+const CLIENT_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/
 let ownedBridgeServer = null
 let shutdownRegistered = false
 
@@ -25,13 +28,14 @@ export const tools = [
   },
   {
     name: 'iagent_generate_image',
-    description: '在用户已登录的 iAgent 创意工坊中提交图片生成任务。返回 taskId，随后用 iagent_generation_get_status 查询。',
+    description: '在用户已登录的 iAgent 创意工坊中提交图片生成任务。调用可能计费；每个新任务使用新的 clientRequestId，重放时必须复用原值。返回 taskId 后查询状态。',
     inputSchema: {
       type: 'object',
-      required: ['prompt'],
+      required: ['prompt', 'clientRequestId'],
       additionalProperties: false,
       properties: {
         prompt: { type: 'string', minLength: 1 },
+        clientRequestId: { type: 'string', minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$', description: '本次生成的唯一幂等 ID。首次调用创建新值；恢复或重放同一请求时必须保持不变。' },
         keyId: { type: 'number' },
         model: { type: 'string' },
         sizeMode: { type: 'string', enum: ['preset', 'custom'], description: 'preset 使用画幅与清晰度；custom 使用精确像素宽高。两种模式互斥。' },
@@ -41,17 +45,18 @@ export const tools = [
         count: { type: 'number', minimum: 1, maximum: 4 }
       }
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true }
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }
   },
   {
     name: 'iagent_generate_video',
-    description: '在用户已登录的 iAgent 创意工坊中提交视频生成任务。返回 taskId，随后用 iagent_generation_get_status 查询。',
+    description: '在用户已登录的 iAgent 创意工坊中提交视频生成任务。调用可能计费；每个新任务使用新的 clientRequestId，重放时必须复用原值。返回 taskId 后查询状态。',
     inputSchema: {
       type: 'object',
-      required: ['prompt'],
+      required: ['prompt', 'clientRequestId'],
       additionalProperties: false,
       properties: {
         prompt: { type: 'string', minLength: 1 },
+        clientRequestId: { type: 'string', minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$', description: '本次生成的唯一幂等 ID。首次调用创建新值；恢复或重放同一请求时必须保持不变。' },
         keyId: { type: 'number' },
         model: { type: 'string' },
         size: { type: 'string', description: 'auto、比例（如 16:9）或像素尺寸' },
@@ -59,7 +64,7 @@ export const tools = [
         duration: { type: 'number', minimum: 1, maximum: 15 }
       }
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true }
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }
   },
   {
     name: 'iagent_generation_get_status',
@@ -126,11 +131,36 @@ function json(res, status, body) {
 
 async function readJson(req) {
   let body = ''
+  let bodyBytes = 0
+  req.setEncoding('utf8')
   for await (const chunk of req) {
+    bodyBytes += Buffer.byteLength(chunk)
+    if (bodyBytes > 1024 * 1024) throw new Error('request body too large')
     body += chunk
-    if (body.length > 1024 * 1024) throw new Error('request body too large')
   }
   return body ? JSON.parse(body) : {}
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function generationRequest(body) {
+  const name = String(body?.name || '')
+  if (!GENERATION_TOOLS.has(name)) return null
+  const input = body?.input && typeof body.input === 'object' && !Array.isArray(body.input) ? body.input : {}
+  const clientRequestId = String(input.clientRequestId || '').trim()
+  if (!CLIENT_REQUEST_ID_PATTERN.test(clientRequestId)) {
+    throw new Error('生成任务需要有效的 clientRequestId（8-128 位字母、数字、点、下划线、冒号或连字符）')
+  }
+  return {
+    key: `${name}:${clientRequestId}`,
+    fingerprint: crypto.createHash('sha256').update(stableJson({ name, input })).digest('hex')
+  }
 }
 
 function sendEvent(res, type, payload) {
@@ -186,6 +216,7 @@ export async function startBridgeServer(inputConfig = loadConfig()) {
   const config = inputConfig
   const clients = new Map()
   const pending = new Map()
+  const generationRequests = new Map()
   let activeClientId = ''
 
   const server = http.createServer(async (req, res) => {
@@ -228,22 +259,53 @@ export async function startBridgeServer(inputConfig = loadConfig()) {
     if (req.method === 'POST' && url.pathname === '/api/tools') {
       try {
         const body = await readJson(req)
-        const client = clients.get(activeClientId)
-        if (!client) return json(res, 409, {
-          ok: false,
-          error: '当前没有已连接的 iAgent 浏览器',
-          connectionUrl: connectionUrl(config)
-        })
-        const requestId = crypto.randomUUID()
-        sendEvent(client, 'tool_call', { requestId, name: body.name, input: body.input || {} })
-        const result = await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => {
-            pending.delete(requestId)
-            reject(new Error('iAgent 浏览器工具执行超时'))
-          }, TOOL_TIMEOUT_MS)
-          pending.set(requestId, { clientId: activeClientId, resolve, reject, timer })
-        })
-        return json(res, 200, { ok: true, result })
+        const idempotency = generationRequest(body)
+        const now = Date.now()
+        for (const [key, item] of generationRequests) {
+          if (item.expiresAt && item.expiresAt <= now) generationRequests.delete(key)
+        }
+        const existing = idempotency ? generationRequests.get(idempotency.key) : null
+        if (existing && existing.fingerprint !== idempotency.fingerprint) {
+          return json(res, 409, { ok: false, error: 'clientRequestId 已用于参数不同的生成请求，请为新任务创建新的 ID' })
+        }
+
+        let request = existing?.promise
+        if (!request) {
+          request = (async () => {
+            const client = clients.get(activeClientId)
+            if (!client) {
+              const error = new Error('当前没有已连接的 iAgent 浏览器')
+              error.connectionUrl = connectionUrl(config)
+              throw error
+            }
+            const requestId = crypto.randomUUID()
+            sendEvent(client, 'tool_call', { requestId, name: body.name, input: body.input || {} })
+            return new Promise((resolve, reject) => {
+              const timer = setTimeout(() => {
+                pending.delete(requestId)
+                reject(new Error('iAgent 浏览器工具执行超时；任务结果未知。不要用新的 clientRequestId 重试'))
+              }, TOOL_TIMEOUT_MS)
+              pending.set(requestId, { clientId: activeClientId, resolve, reject, timer })
+            })
+          })()
+          if (idempotency) generationRequests.set(idempotency.key, { fingerprint: idempotency.fingerprint, promise: request, expiresAt: 0 })
+        }
+
+        try {
+          const result = await request
+          if (idempotency) {
+            const item = generationRequests.get(idempotency.key)
+            if (item?.promise === request) item.expiresAt = Date.now() + IDEMPOTENCY_TTL_MS
+          }
+          return json(res, 200, { ok: true, result, replayed: Boolean(existing) })
+        } catch (error) {
+          if (idempotency) {
+            const item = generationRequests.get(idempotency.key)
+            if (item?.promise === request) generationRequests.delete(idempotency.key)
+          }
+          if (error?.connectionUrl) return json(res, 409, { ok: false, error: error.message, connectionUrl: error.connectionUrl })
+          throw error
+        }
       } catch (error) {
         return json(res, 500, { ok: false, error: error instanceof Error ? error.message : 'tool call failed' })
       }
@@ -330,7 +392,7 @@ export function startMcpServer(config) {
     const base = { jsonrpc: '2.0', id: request.id }
     try {
       if (request.method === 'initialize') {
-        return writeMessage({ ...base, result: { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'iagent', version: '0.1.0' }, instructions: '先用 iagent_studio_get_config 获取可用模型和参数，再提交图片或视频任务；生成任务是异步的，用 iagent_generation_get_status 查询。' } })
+        return writeMessage({ ...base, result: { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'iagent', version: '0.1.0' }, instructions: '先用 iagent_studio_get_config 获取参数。每个新生成任务创建唯一 clientRequestId；结果未知时不得换 ID 或改写提示词自动重试，可先用该 ID 作为 taskId 查询。' } })
       }
       if (request.method === 'ping') return writeMessage({ ...base, result: {} })
       if (request.method === 'tools/list') return writeMessage({ ...base, result: { tools } })
