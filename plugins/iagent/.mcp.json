@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "iagent": {
+      "command": "node",
+      "args": ["server.mjs", "mcp"],
+      "cwd": ".",
+      "startup_timeout_sec": 20,
+      "tool_timeout_sec": 90
+    }
+  }
+}

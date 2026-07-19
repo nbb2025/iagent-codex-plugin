@@ -1,0 +1,38 @@
+{
+  "name": "iagent",
+  "version": "0.1.0+codex.20260719181049",
+  "description": "Generate images and videos in iAgent from Codex through a local browser bridge.",
+  "author": {
+    "name": "iAgent",
+    "url": "https://ai.iagent.dev"
+  },
+  "homepage": "https://ai.iagent.dev",
+  "repository": "https://github.com/nbb2025/iagent-codex-plugin",
+  "keywords": [
+    "iagent",
+    "image-generation",
+    "video-generation",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "iAgent",
+    "shortDescription": "Generate images and videos with iAgent.",
+    "longDescription": "Connects Codex to the signed-in iAgent Creative Studio through a token-protected local bridge. Codex can inspect available models, submit image or video jobs, and query their status without receiving the user's API key.",
+    "developerName": "iAgent",
+    "category": "Productivity",
+    "capabilities": [
+      "Image Generation",
+      "Video Generation",
+      "MCP"
+    ],
+    "websiteURL": "https://ai.iagent.dev",
+    "defaultPrompt": [
+      "Use iAgent to generate an image from my prompt.",
+      "Create a short video in iAgent and track its progress.",
+      "Show the image and video models available in iAgent."
+    ],
+    "brandColor": "#0071E3"
+  },
+  "mcpServers": "./.mcp.json"
+}
